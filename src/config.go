@@ -14,6 +14,7 @@ import (
 type Config struct {
 	UserAgent                  string
 	Port                       int
+	ProxyMode                  string
 	LogLevel                   string
 	ShowVer                    bool
 	LogFile                    string
@@ -42,6 +43,7 @@ func NewConfig() (*Config, error) {
 	var (
 		userAgent                  string
 		port                       int
+		proxyMode                  string
 		logLevel                   string
 		showVer                    bool
 		forceReplace               bool
@@ -67,7 +69,8 @@ func NewConfig() (*Config, error) {
 
 	// 2. 注册 flag
 	flag.StringVar(&userAgent, "u", "FFF", "User-Agent string")
-	flag.IntVar(&port, "port", 8080, "TPROXY listen port")
+	flag.IntVar(&port, "port", 8080, "Transparent proxy listen port")
+	flag.StringVar(&proxyMode, "proxy-mode", "redirect", "Transparent proxy mode (redirect or tproxy)")
 	flag.StringVar(&logLevel, "loglevel", "info", "Log level (debug, info, warn, error)")
 	flag.BoolVar(&showVer, "v", false, "Show version")
 	flag.StringVar(&logFile, "log", "", "Log file path (e.g., /tmp/UAmask.log). Default is stdout.")
@@ -104,6 +107,7 @@ func NewConfig() (*Config, error) {
 	cfg := &Config{
 		UserAgent:            userAgent,
 		Port:                 port,
+		ProxyMode:            strings.ToLower(strings.TrimSpace(proxyMode)),
 		LogLevel:             logLevel,
 		ShowVer:              showVer,
 		LogFile:              logFile,
@@ -153,6 +157,9 @@ func NewConfig() (*Config, error) {
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", cfg.Port)
 	}
+	if cfg.ProxyMode != "redirect" && cfg.ProxyMode != "tproxy" {
+		return nil, fmt.Errorf("invalid proxy mode: %s", cfg.ProxyMode)
+	}
 	if cfg.BufferSize < 1024 || cfg.BufferSize > 65536 {
 		return nil, fmt.Errorf("invalid buffer size: %d", cfg.BufferSize)
 	}
@@ -186,6 +193,7 @@ func NewConfig() (*Config, error) {
 func (c *Config) LogConfig(version string) {
 	logrus.Infof("UA-MASK v%s", version)
 	logrus.Infof("Port: %d", c.Port)
+	logrus.Infof("Proxy Mode: %s", c.ProxyMode)
 	logrus.Infof("User-Agent: %s", c.UserAgent)
 	logrus.Infof("Log level: %s", c.LogLevel)
 	logrus.Infof("User-Agent Whitelist: %v", c.Whitelist)

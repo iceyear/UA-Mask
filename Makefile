@@ -32,8 +32,8 @@ define Package/UAmask
 endef
 
 define Package/UAmask/description
-	A transparent proxy (TPROXY) for modifying HTTP User-Agent.
-	This is the default version using nftables (firewall4).
+	A transparent proxy for modifying HTTP User-Agent.
+	It can use REDIRECT or TPROXY rules with nftables/firewall4 or iptables/firewall3.
 endef
 
 define Build/Prepare

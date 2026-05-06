@@ -4,17 +4,57 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"syscall"
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
-// getOriginalDst 获取被 REDIRECT 规则重定向前的原始目标地址
+func listenTCP(port int, proxyMode string) (*net.TCPListener, error) {
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	if proxyMode != "tproxy" {
+		return net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4zero, Port: port})
+	}
+
+	listenConfig := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			if err := c.Control(func(fd uintptr) {
+				sockErr = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
+			}); err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+
+	listener, err := listenConfig.Listen(context.Background(), "tcp4", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	tcpListener, ok := listener.(*net.TCPListener)
+	if !ok {
+		listener.Close()
+		return nil, fmt.Errorf("listener is %T, expected *net.TCPListener", listener)
+	}
+	return tcpListener, nil
+}
+
+func getOriginalDst(conn *net.TCPConn, proxyMode string) (*net.TCPAddr, error) {
+	if proxyMode == "tproxy" {
+		return getTProxyOriginalDst(conn)
+	}
+	return getRedirectOriginalDst(conn)
+}
+
+// getRedirectOriginalDst 获取被 REDIRECT 规则重定向前的原始目标地址
 // 使用 SO_ORIGINAL_DST socket 选项，这是 iptables REDIRECT 目标填充的
-func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
+func getRedirectOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
 	file, err := conn.File()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get file descriptor: %w", err)
@@ -51,4 +91,17 @@ func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
 		IP:   ip,
 		Port: port,
 	}, nil
+}
+
+// getTProxyOriginalDst 获取 TPROXY 保留的原始目标地址。
+// TCP TPROXY 不做 NAT，内核会把原始目的地址保留为 accepted socket 的本地地址。
+func getTProxyOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
+	addr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return nil, fmt.Errorf("local address is %T, expected *net.TCPAddr", conn.LocalAddr())
+	}
+	if addr.IP == nil || addr.IP.IsUnspecified() || addr.Port == 0 {
+		return nil, fmt.Errorf("invalid TPROXY original destination: %s", addr.String())
+	}
+	return addr, nil
 }

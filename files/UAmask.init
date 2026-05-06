@@ -19,6 +19,11 @@ CHAIN_OUTPUT="UAmask_output"
 
 IPSET_NAME="UAmask_bypass_set"
 
+DEFAULT_TPROXY_MARK="0x55414d"
+DEFAULT_TPROXY_TABLE="100"
+DEFAULT_TPROXY_PRIORITY="100"
+DEFAULT_BYPASS_FWMARKS="0x50535732"
+
 # --- 防火墙检测 ---
 FW_TYPE=""
 
@@ -33,6 +38,79 @@ detect_firewall() {
 # 脚本加载时执行防火墙检测
 detect_firewall
 
+normalize_proxy_mode() {
+    case "$1" in
+        tproxy) echo "tproxy" ;;
+        *) echo "redirect" ;;
+    esac
+}
+
+is_valid_fwmark() {
+    echo "$1" | grep -Eq '^(0x[0-9a-fA-F]+|[0-9]+)$'
+}
+
+sanitize_fwmarks() {
+    local out mark
+    for mark in $1; do
+        if is_valid_fwmark "$mark"; then
+            out="$out $mark"
+        else
+            logger -t "$NAME" "Ignoring invalid fwmark: $mark"
+        fi
+    done
+    echo "${out# }"
+}
+
+sanitize_tproxy_mark() {
+    local marks
+    marks="$(sanitize_fwmarks "$1")"
+    set -- $marks
+    echo "${1:-$DEFAULT_TPROXY_MARK}"
+}
+
+sanitize_uint() {
+    case "$1" in
+        ""|*[!0-9]*) echo "$2" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+nft_fwmark_return_lines() {
+    local mark
+    for mark in $1; do
+        echo "    meta mark $mark return"
+    done
+}
+
+ipt_add_fwmark_returns() {
+    local table="$1"
+    local chain="$2"
+    local marks="$3"
+    local mark
+    for mark in $marks; do
+        $IPT -t "$table" -A "$chain" -m mark --mark "$mark" -j RETURN
+    done
+}
+
+setup_tproxy_route() {
+    local mark="$1"
+    local table="$2"
+    local priority="$3"
+
+    ip rule del fwmark "$mark" table "$table" priority "$priority" 2>/dev/null || true
+    ip rule add fwmark "$mark" table "$table" priority "$priority" 2>/dev/null || true
+    ip route replace local 0.0.0.0/0 dev lo table "$table" 2>/dev/null || \
+        ip route add local 0.0.0.0/0 dev lo table "$table" 2>/dev/null || true
+}
+
+cleanup_tproxy_route() {
+    local mark="$1"
+    local table="$2"
+
+    ip rule del fwmark "$mark" 2>/dev/null || true
+    ip route del local 0.0.0.0/0 dev lo table "$table" 2>/dev/null || true
+}
+
 # NFTABLES (fw4) 函数
 
 # 仅清理规则和 uci，不重载 (NFT helper)
@@ -45,10 +123,21 @@ unset_firewall_rules_nft() {
 # 清理防火墙规则并重载 (NFT)
 unset_firewall_nft() {
     logger -t "$NAME" "Removing firewall rules (nft)..."
+    config_load "$NAME"
+    local tproxy_fwmark tproxy_table
+    config_get tproxy_fwmark "main" "tproxy_fwmark" "$DEFAULT_TPROXY_MARK"
+    config_get tproxy_table "main" "tproxy_table" "$DEFAULT_TPROXY_TABLE"
+    tproxy_fwmark="$(sanitize_tproxy_mark "$tproxy_fwmark")"
+    tproxy_table="$(sanitize_uint "$tproxy_table" "$DEFAULT_TPROXY_TABLE")"
+
     unset_firewall_rules_nft
     nft delete chain inet fw4 UAmask_prerouting_before 2>/dev/null || true
     nft delete chain inet fw4 UAmask_output_after 2>/dev/null || true
+    nft delete chain inet fw4 UAmask_prerouting_mangle 2>/dev/null || true
+    nft delete chain inet fw4 UAmask_output_mangle 2>/dev/null || true
     nft delete set inet fw4 ${IPSET_NAME} 2>/dev/null || true
+    cleanup_tproxy_route "$tproxy_fwmark" "$tproxy_table"
+    cleanup_tproxy_route "$DEFAULT_TPROXY_MARK" "$DEFAULT_TPROXY_TABLE"
     fw4 reload >/dev/null 2>&1
     logger -t "$NAME" "Firewall rules removed (nft)."
 }
@@ -65,9 +154,14 @@ set_firewall_nft() {
     local bypass_gid
     local bypass_ports_list
     local bypass_ips_list
-    local force_replace
     local proxy_host
     local enable_firewall_set
+    local proxy_mode
+    local bypass_fwmarks_list
+    local bypass_fwmarks
+    local tproxy_fwmark
+    local tproxy_table
+    local tproxy_priority
 
     config_get port "main" "port" "12032"
     config_get iface_list "main" "iface" "br-lan"
@@ -76,6 +170,17 @@ set_firewall_nft() {
     config_get bypass_ips_list "main" "bypass_ips" ""
     config_get_bool proxy_host "main" "proxy_host" ""
     config_get_bool enable_firewall_set "main" "enable_firewall_set" "0"
+    config_get proxy_mode "main" "proxy_mode" "redirect"
+    config_get bypass_fwmarks_list "main" "bypass_fwmarks" "$DEFAULT_BYPASS_FWMARKS"
+    config_get tproxy_fwmark "main" "tproxy_fwmark" "$DEFAULT_TPROXY_MARK"
+    config_get tproxy_table "main" "tproxy_table" "$DEFAULT_TPROXY_TABLE"
+    config_get tproxy_priority "main" "tproxy_priority" "$DEFAULT_TPROXY_PRIORITY"
+
+    proxy_mode="$(normalize_proxy_mode "$proxy_mode")"
+    bypass_fwmarks="$(sanitize_fwmarks "$bypass_fwmarks_list")"
+    tproxy_fwmark="$(sanitize_tproxy_mark "$tproxy_fwmark")"
+    tproxy_table="$(sanitize_uint "$tproxy_table" "$DEFAULT_TPROXY_TABLE")"
+    tproxy_priority="$(sanitize_uint "$tproxy_priority" "$DEFAULT_TPROXY_PRIORITY")"
 
     # 3. 格式化接口
     local nft_ifaces
@@ -91,9 +196,9 @@ set_firewall_nft() {
     if [ -n "$bypass_ips_list" ]; then
         local nft_ips
         nft_ips="{ $(echo "$bypass_ips_list" | sed -e 's/ /, /g') }"
-        nft_ips_rule="ip daddr != $nft_ips \\"
+        nft_ips_rule="    ip daddr $nft_ips return"
     else
-        nft_ips_rule="# No bypass IPs configured"
+        nft_ips_rule=""
     fi
 
     # 5. 格式化豁免 Ports
@@ -101,9 +206,9 @@ set_firewall_nft() {
     if [ -n "$bypass_ports_list" ]; then
         local nft_ports
         nft_ports="{ $(echo "$bypass_ports_list" | sed -e 's/ /, /g') }"
-        nft_ports_rule="tcp dport != $nft_ports \\"
+        nft_ports_rule="    tcp dport $nft_ports return"
     else
-        nft_ports_rule="# No bypass ports configured"
+        nft_ports_rule=""
     fi
 
     > "${NFT_PATH}"
@@ -122,43 +227,77 @@ set_firewall_nft() {
     fi
 
     # 6. 动态写入 .nft 文件
+    if [ "$proxy_mode" = "tproxy" ]; then
+        setup_tproxy_route "$tproxy_fwmark" "$tproxy_table" "$tproxy_priority"
 cat > "${NFT_PATH}" << EOF
-chain UAmask_prerouting_before {
-    type nat hook prerouting priority dstnat - 1;
-    
-    $( [ "$enable_firewall_set" = "1" ] && echo "iifname $nft_ifaces ip protocol tcp ip daddr . tcp dport @$IPSET_NAME return" )
+chain UAmask_prerouting_mangle {
+    type filter hook prerouting priority mangle - 2;
 
-    iifname $nft_ifaces ip protocol tcp \\
-    $nft_ips_rule
-    $nft_ports_rule
-    redirect to :$port
+    iifname "lo" meta mark $tproxy_fwmark ip protocol tcp tproxy ip to :$port accept
+$(nft_fwmark_return_lines "$bypass_fwmarks")
+    $( [ "$enable_firewall_set" = "1" ] && echo "iifname $nft_ifaces ip protocol tcp ip daddr . tcp dport @$IPSET_NAME return" )
+$nft_ips_rule
+$nft_ports_rule
+    iifname $nft_ifaces ip protocol tcp tproxy ip to :$port meta mark set $tproxy_fwmark accept
 }
 
 EOF
 
-    if [ "$proxy_host" = "1" ]; then
+        if [ "$proxy_host" = "1" ]; then
+cat >> "${NFT_PATH}" << EOF
+
+chain UAmask_output_mangle {
+    type route hook output priority mangle;
+
+$(nft_fwmark_return_lines "$bypass_fwmarks")
+    meta mark $tproxy_fwmark return
+    oifname "lo" return
+    ip protocol tcp meta skgid { $bypass_gid, 65534 } return
+    $( [ "$enable_firewall_set" = "1" ] && echo "ip protocol tcp ip daddr . tcp dport @$IPSET_NAME return" )
+$nft_ips_rule
+$nft_ports_rule
+    ip protocol tcp meta mark set $tproxy_fwmark accept
+}
+
+EOF
+            logger -t "$NAME" "proxy_host is enabled. Added UAmask_output_mangle chain."
+        else
+            logger -t "$NAME" "proxy_host is disabled. Skipping UAmask_output_mangle chain."
+        fi
+    else
+        cleanup_tproxy_route "$tproxy_fwmark" "$tproxy_table"
+cat > "${NFT_PATH}" << EOF
+chain UAmask_prerouting_before {
+    type nat hook prerouting priority dstnat - 1;
+
+$(nft_fwmark_return_lines "$bypass_fwmarks")
+    $( [ "$enable_firewall_set" = "1" ] && echo "iifname $nft_ifaces ip protocol tcp ip daddr . tcp dport @$IPSET_NAME return" )
+$nft_ips_rule
+$nft_ports_rule
+    iifname $nft_ifaces ip protocol tcp redirect to :$port
+}
+
+EOF
+
+        if [ "$proxy_host" = "1" ]; then
 cat >> "${NFT_PATH}" << EOF
 
 chain UAmask_output_after {
     type nat hook output priority -100;
 
+$(nft_fwmark_return_lines "$bypass_fwmarks")
+    ip protocol tcp meta skgid { $bypass_gid, 65534 } return
     $( [ "$enable_firewall_set" = "1" ] && echo "ip protocol tcp ip daddr . tcp dport @$IPSET_NAME return" )
-
-    ip protocol tcp \\
-    # 豁免局域网、环回、保留地址等
-    $nft_ips_rule
-    # 豁免端口
-    $nft_ports_rule
-    # 豁免 UAmask 自己的流量
-    # 同时豁免 OpenClash 的流量 (GID 65534)，防止循环
-    meta skgid != { $bypass_gid, 65534 } \\
-    redirect to :$port
+$nft_ips_rule
+$nft_ports_rule
+    ip protocol tcp redirect to :$port
 }
 
 EOF
-        logger -t "$NAME" "proxy_host is enabled. Added UAmask_output_after chain."
-    else
-        logger -t "$NAME" "proxy_host is disabled. Skipping UAmask_output_after chain."
+            logger -t "$NAME" "proxy_host is enabled. Added UAmask_output_after chain."
+        else
+            logger -t "$NAME" "proxy_host is disabled. Skipping UAmask_output_after chain."
+        fi
     fi
     logger -t "$NAME" "Generated nftables rules at ${NFT_PATH}"
     # 7. 注册防火墙规则
@@ -169,8 +308,10 @@ EOF
     uci commit firewall
     nft delete chain inet fw4 UAmask_prerouting_before 2>/dev/null || true
     nft delete chain inet fw4 UAmask_output_after 2>/dev/null || true
+    nft delete chain inet fw4 UAmask_prerouting_mangle 2>/dev/null || true
+    nft delete chain inet fw4 UAmask_output_mangle 2>/dev/null || true
     fw4 reload >/dev/null 2>&1
-    logger -t "$NAME" "Firewall rules applied (nft)."
+    logger -t "$NAME" "Firewall rules applied (nft, mode=$proxy_mode)."
 }
 
 # IPTABLES (fw3) 函数
@@ -178,19 +319,33 @@ EOF
 # 清理防火墙规则并重载 (IPT)
 unset_firewall_ipt() {
     logger -t "$NAME" "Removing firewall rules (iptables)..."
+    config_load "$NAME"
+    local tproxy_fwmark tproxy_table
+    config_get tproxy_fwmark "main" "tproxy_fwmark" "$DEFAULT_TPROXY_MARK"
+    config_get tproxy_table "main" "tproxy_table" "$DEFAULT_TPROXY_TABLE"
+    tproxy_fwmark="$(sanitize_tproxy_mark "$tproxy_fwmark")"
+    tproxy_table="$(sanitize_uint "$tproxy_table" "$DEFAULT_TPROXY_TABLE")"
     
     # 循环尝试删除跳转规则，直到成功或失败
     while $IPT -t nat -D PREROUTING -j $CHAIN_PREROUTING 2>/dev/null; do :; done
     while $IPT -t nat -D OUTPUT -j $CHAIN_OUTPUT 2>/dev/null; do :; done
+    while $IPT -t mangle -D PREROUTING -j $CHAIN_PREROUTING 2>/dev/null; do :; done
+    while $IPT -t mangle -D OUTPUT -j $CHAIN_OUTPUT 2>/dev/null; do :; done
 
 
     $IPT -t nat -F $CHAIN_PREROUTING 2>/dev/null || true
     $IPT -t nat -X $CHAIN_PREROUTING 2>/dev/null || true
+    $IPT -t mangle -F $CHAIN_PREROUTING 2>/dev/null || true
+    $IPT -t mangle -X $CHAIN_PREROUTING 2>/dev/null || true
     
     $IPT -t nat -F $CHAIN_OUTPUT 2>/dev/null || true
     $IPT -t nat -X $CHAIN_OUTPUT 2>/dev/null || true
+    $IPT -t mangle -F $CHAIN_OUTPUT 2>/dev/null || true
+    $IPT -t mangle -X $CHAIN_OUTPUT 2>/dev/null || true
     
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    cleanup_tproxy_route "$tproxy_fwmark" "$tproxy_table"
+    cleanup_tproxy_route "$DEFAULT_TPROXY_MARK" "$DEFAULT_TPROXY_TABLE"
 
     /etc/init.d/firewall reload >/dev/null 2>&1
     logger -t "$NAME" "Firewall rules removed (iptables)."
@@ -201,7 +356,7 @@ set_firewall_ipt() {
     # 1. 确保旧规则被彻底清除
     unset_firewall_ipt
 
-    # 2. 从 UCI 读取配置 (此部分不变)
+    # 2. 从 UCI 读取配置
     config_load "$NAME"
     local port
     local iface_list
@@ -210,6 +365,12 @@ set_firewall_ipt() {
     local bypass_ips_list
     local proxy_host
     local enable_firewall_set
+    local proxy_mode
+    local bypass_fwmarks_list
+    local bypass_fwmarks
+    local tproxy_fwmark
+    local tproxy_table
+    local tproxy_priority
 
     config_get port "main" "port" "12032"
     config_get iface_list "main" "iface" "br-lan"
@@ -217,8 +378,19 @@ set_firewall_ipt() {
     config_get bypass_ports_list "main" "bypass_ports" ""
     config_get bypass_ips_list "main" "bypass_ips" ""
     config_get_bool proxy_host "main" "proxy_host" ""
-
     config_get_bool enable_firewall_set "main" "enable_firewall_set" "0"
+    config_get proxy_mode "main" "proxy_mode" "redirect"
+    config_get bypass_fwmarks_list "main" "bypass_fwmarks" "$DEFAULT_BYPASS_FWMARKS"
+    config_get tproxy_fwmark "main" "tproxy_fwmark" "$DEFAULT_TPROXY_MARK"
+    config_get tproxy_table "main" "tproxy_table" "$DEFAULT_TPROXY_TABLE"
+    config_get tproxy_priority "main" "tproxy_priority" "$DEFAULT_TPROXY_PRIORITY"
+
+    proxy_mode="$(normalize_proxy_mode "$proxy_mode")"
+    bypass_fwmarks="$(sanitize_fwmarks "$bypass_fwmarks_list")"
+    tproxy_fwmark="$(sanitize_tproxy_mark "$tproxy_fwmark")"
+    tproxy_table="$(sanitize_uint "$tproxy_table" "$DEFAULT_TPROXY_TABLE")"
+    tproxy_priority="$(sanitize_uint "$tproxy_priority" "$DEFAULT_TPROXY_PRIORITY")"
+
     if [ "$enable_firewall_set" = "1" ]; then
         if ! command -v ipset >/dev/null 2>&1; then
             logger -t "$NAME" "Error: 'ipset' package is not installed. Domain bypass disabled."
@@ -228,65 +400,107 @@ set_firewall_ipt() {
             ipset create "$IPSET_NAME" hash:ip,port timeout 600 -exist
         fi
     fi
-    # --- IPTABLES 规则设置 ---
 
-    # 3. 创建自定义链
+    local ipt_ports
+    [ -n "$bypass_ports_list" ] && ipt_ports=$(echo "$bypass_ports_list" | sed 's/ /,/g')
+
+    if [ "$proxy_mode" = "tproxy" ]; then
+        setup_tproxy_route "$tproxy_fwmark" "$tproxy_table" "$tproxy_priority"
+
+        $IPT -t mangle -N $CHAIN_PREROUTING
+        $IPT -t mangle -N $CHAIN_OUTPUT
+
+        # 本机 OUTPUT 被 fwmark 路由回 lo 后，在 PREROUTING 里交给 TPROXY socket。
+        $IPT -t mangle -A $CHAIN_PREROUTING -i lo -p tcp -m mark --mark "$tproxy_fwmark" \
+            -j TPROXY --on-port "$port" --tproxy-mark "$tproxy_fwmark"/0xffffffff
+
+        ipt_add_fwmark_returns "mangle" "$CHAIN_PREROUTING" "$bypass_fwmarks"
+        if [ "$enable_firewall_set" = "1" ]; then
+            $IPT -t mangle -A $CHAIN_PREROUTING -m set --match-set "$IPSET_NAME" dst,dst -j RETURN
+        fi
+
+        for iface in $iface_list; do
+            for ip in $bypass_ips_list; do
+                $IPT -t mangle -A $CHAIN_PREROUTING -i "$iface" -p tcp -d "$ip" -j RETURN
+            done
+            if [ -n "$ipt_ports" ]; then
+                $IPT -t mangle -A $CHAIN_PREROUTING -i "$iface" -p tcp -m multiport --dports "$ipt_ports" -j RETURN
+            fi
+            $IPT -t mangle -A $CHAIN_PREROUTING -i "$iface" -p tcp \
+                -j TPROXY --on-port "$port" --tproxy-mark "$tproxy_fwmark"/0xffffffff
+        done
+
+        if [ "$proxy_host" = "1" ]; then
+            ipt_add_fwmark_returns "mangle" "$CHAIN_OUTPUT" "$bypass_fwmarks"
+            $IPT -t mangle -A $CHAIN_OUTPUT -m mark --mark "$tproxy_fwmark" -j RETURN
+            $IPT -t mangle -A $CHAIN_OUTPUT -o lo -j RETURN
+            $IPT -t mangle -A $CHAIN_OUTPUT -p tcp -m owner --gid-owner "$bypass_gid" -j RETURN
+            $IPT -t mangle -A $CHAIN_OUTPUT -p tcp -m owner --gid-owner "65534" -j RETURN
+            if [ "$enable_firewall_set" = "1" ]; then
+                $IPT -t mangle -A $CHAIN_OUTPUT -m set --match-set "$IPSET_NAME" dst,dst -j RETURN
+            fi
+            for ip in $bypass_ips_list; do
+                $IPT -t mangle -A $CHAIN_OUTPUT -p tcp -d "$ip" -j RETURN
+            done
+            if [ -n "$ipt_ports" ]; then
+                $IPT -t mangle -A $CHAIN_OUTPUT -p tcp -m multiport --dports "$ipt_ports" -j RETURN
+            fi
+            $IPT -t mangle -A $CHAIN_OUTPUT -p tcp -j MARK --set-mark "$tproxy_fwmark"
+            $IPT -t mangle -A OUTPUT -j $CHAIN_OUTPUT
+            logger -t "$NAME" "proxy_host is enabled. Added iptables mangle OUTPUT rules."
+        else
+            logger -t "$NAME" "proxy_host is disabled. Skipping OUTPUT chain rules."
+        fi
+
+        $IPT -t mangle -I PREROUTING 1 -j $CHAIN_PREROUTING
+        logger -t "$NAME" "Firewall rules (iptables, mode=tproxy) applied."
+        return
+    fi
+
+    cleanup_tproxy_route "$tproxy_fwmark" "$tproxy_table"
+
+    # --- REDIRECT 规则设置 ---
     $IPT -t nat -N $CHAIN_PREROUTING
     $IPT -t nat -N $CHAIN_OUTPUT
 
+    ipt_add_fwmark_returns "nat" "$CHAIN_PREROUTING" "$bypass_fwmarks"
     if [ "$enable_firewall_set" = "1" ]; then
         $IPT -t nat -A $CHAIN_PREROUTING -m set --match-set "$IPSET_NAME" dst,dst -j RETURN
     fi
 
-    # 4. 填充 PREROUTING 链
     for iface in $iface_list; do
         for ip in $bypass_ips_list; do
             $IPT -t nat -A $CHAIN_PREROUTING -i "$iface" -p tcp -d "$ip" -j RETURN
         done
-        if [ -n "$bypass_ports_list" ]; then
-            local ipt_ports=$(echo "$bypass_ports_list" | sed 's/ /,/g')
+        if [ -n "$ipt_ports" ]; then
             $IPT -t nat -A $CHAIN_PREROUTING -i "$iface" -p tcp -m multiport --dports "$ipt_ports" -j RETURN
         fi
-        # 将剩余的 TCP 流量重定向到代理端口
         $IPT -t nat -A $CHAIN_PREROUTING -i "$iface" -p tcp -j REDIRECT --to-port "$port"
     done
 
-    # 5. OUTPUT 链处理本机流量
     if [ "$proxy_host" = "1" ]; then
-        # 域名绕过规则
+        ipt_add_fwmark_returns "nat" "$CHAIN_OUTPUT" "$bypass_fwmarks"
         if [ "$enable_firewall_set" = "1" ]; then
-            $IPT -t nat -A $CHAIN_OUTPUT -m set --match-set "$IPSET_NAME" dst -j RETURN
+            $IPT -t nat -A $CHAIN_OUTPUT -m set --match-set "$IPSET_NAME" dst,dst -j RETURN
         fi
-        # 豁免 UAmask 自己的流量 (通过 GID)
         $IPT -t nat -A $CHAIN_OUTPUT -p tcp -m owner --gid-owner "$bypass_gid" -j RETURN
-        # 同时豁免 OpenClash 的流量 (GID 65534)，防止循环
         $IPT -t nat -A $CHAIN_OUTPUT -p tcp -m owner --gid-owner "65534" -j RETURN
-        
-        # 豁免指定的目标 IP
         for ip in $bypass_ips_list; do
             $IPT -t nat -A $CHAIN_OUTPUT -p tcp -d "$ip" -j RETURN
         done
-        
-        # 豁免指定的端口
-        if [ -n "$bypass_ports_list" ]; then
-            local ipt_ports=$(echo "$bypass_ports_list" | sed 's/ /,/g')
+        if [ -n "$ipt_ports" ]; then
             $IPT -t nat -A $CHAIN_OUTPUT -p tcp -m multiport --dports "$ipt_ports" -j RETURN
         fi
-
-        # 将剩余的 TCP 流量重定向到代理端口
         $IPT -t nat -A $CHAIN_OUTPUT -p tcp -j REDIRECT --to-port "$port"
-        
-        # 将自定义 OUTPUT 链挂载到内置的 OUTPUT 链
         $IPT -t nat -I OUTPUT 1 -j $CHAIN_OUTPUT
         logger -t "$NAME" "proxy_host is enabled. Added iptables rules for OUTPUT chain."
     else
         logger -t "$NAME" "proxy_host is disabled. Skipping OUTPUT chain rules."
     fi
 
-    # 6. 将自定义 PREROUTING 链挂载到内置的 PREROUTING 链
     $IPT -t nat -I PREROUTING 1 -j $CHAIN_PREROUTING
     
-    logger -t "$NAME" "Firewall rules (iptables) applied."
+    logger -t "$NAME" "Firewall rules (iptables, mode=redirect) applied."
 }
 
 
@@ -339,12 +553,14 @@ start_service() {
         setup_group 
     fi
 
-    local port ua log_level log_file whitelist
+    local port ua log_level log_file whitelist proxy_mode
     config_get port "main" "port" "12032"
     config_get ua "main" "ua" "FFF"
     config_get log_level "main" "log_level" "info"
     config_get log_file "main" "log_file" "/tmp/UAmask/UAmask.log"
     config_get whitelist "main" "whitelist" ""
+    config_get proxy_mode "main" "proxy_mode" "redirect"
+    proxy_mode="$(normalize_proxy_mode "$proxy_mode")"
 
     local firewall_ua_whitelist
     local enable_firewall_set
@@ -370,6 +586,7 @@ start_service() {
 
     #  添加基础参数
     procd_append_param command -port "$port"
+    procd_append_param command -proxy-mode "$proxy_mode"
     procd_append_param command -u "$ua"
     procd_append_param command -loglevel "$log_level"
     [ -n "$whitelist" ] && procd_append_param command -w "$whitelist"

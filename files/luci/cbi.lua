@@ -42,7 +42,7 @@ UAmask = Map("UAmask",
     </style>
         <a href="https://github.com/Zesuy/UA-Mask" target="_blank">版本：0.4.3</a>
         <br>
-        用于修改 User-Agent 的透明代理，使用 REDIRECT 技术实现。
+        用于修改 User-Agent 的透明代理，支持 REDIRECT 与 TPROXY。
         <br>
     ]]
 )
@@ -183,6 +183,12 @@ port = main:taboption("network", Value, "port", "监听端口")
 port.default = "12032"
 port.datatype = "port"
 
+proxy_mode = main:taboption("network", ListValue, "proxy_mode", "透明代理模式")
+proxy_mode:value("redirect", "REDIRECT")
+proxy_mode:value("tproxy", "TPROXY")
+proxy_mode.default = "redirect"
+proxy_mode.description = "REDIRECT 兼容性最好；TPROXY 保留原始目标地址，可能有更低的内核路径开销。"
+
 iface = main:taboption("network", Value, "iface", "监听接口")
 iface.default = "br-lan"
 iface.description = "指定监听的 LAN 口。"
@@ -211,7 +217,27 @@ bypass_gid = main:taboption("network", Value, "bypass_gid", "绕过 GID")
 bypass_gid:depends("proxy_host", "1")
 bypass_gid.default = "65533"
 bypass_gid.datatype = "uinteger"
-bypass_gid.description = "用于绕过 TPROXY 自身流量的 GID。"
+bypass_gid.description = "用于绕过 UAmask 自身流量的 GID。"
+
+bypass_fwmarks = main:taboption("network", Value, "bypass_fwmarks", "绕过 fwmark")
+bypass_fwmarks.default = "0x50535732"
+bypass_fwmarks.placeholder = "0x50535732"
+bypass_fwmarks.description = "带有这些 fwmark 的流量不会进入 UAmask。多个值用空格分隔；默认值用于绕过 passwall2 输出流量。"
+
+tproxy_fwmark = main:taboption("network", Value, "tproxy_fwmark", "TPROXY fwmark")
+tproxy_fwmark:depends("proxy_mode", "tproxy")
+tproxy_fwmark.default = "0x55414d"
+tproxy_fwmark.description = "UAmask TPROXY 模式内部使用的 fwmark，请避免与其他透明代理重复。"
+
+tproxy_table = main:taboption("network", Value, "tproxy_table", "TPROXY 路由表")
+tproxy_table:depends("proxy_mode", "tproxy")
+tproxy_table.datatype = "uinteger"
+tproxy_table.default = "100"
+
+tproxy_priority = main:taboption("network", Value, "tproxy_priority", "TPROXY 路由优先级")
+tproxy_priority:depends("proxy_mode", "tproxy")
+tproxy_priority.datatype = "uinteger"
+tproxy_priority.default = "100"
 
 bypass_ports = main:taboption("network", Value, "bypass_ports", "绕过目标端口")
 bypass_ports.placeholder = "22 443"

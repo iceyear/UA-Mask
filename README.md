@@ -55,9 +55,10 @@
 ## ✨ 特性
 
 *   **一键启用**: 自动配置 `nftables` 或 `iptables` 防火墙，开箱即用。
-*   **高性能 & 低GC**: 采用 Redirect 架构，开销极低；使用 bufio pool 和 worker pool，GC 极低。
+*   **高性能 & 低GC**: 支持 REDIRECT 与 TPROXY 两种透明代理模式；使用 bufio pool 和 worker pool，GC 极低。
 *   **高效 UA 缓存**: 90% 以上请求命中 LRU 缓存，极大减少重复匹配开销。
 *   **流量卸载**: 支持使用 `ipset`/`nfset` 动态绕过非 HTTP 流量及白名单目标，极大提升性能。
+*   **代理共存**: 支持按 `fwmark` 绕过其他透明代理输出流量，默认兼容 passwall2 的 `0x50535732` 标记。
 *   **多种匹配模式**: 支持关键词、正则表达式，全部覆盖。
 *   **零泄露**: 正确处理 HTTP、非 HTTP 及混合流量中每个请求的 UA。
 

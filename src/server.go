@@ -22,12 +22,12 @@ func NewServer(config *Config, handler *HTTPHandler) *Server {
 }
 
 func (s *Server) Run() error {
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: s.config.Port})
+	listener, err := listenTCP(s.config.Port, s.config.ProxyMode)
 	if err != nil {
 		return fmt.Errorf("listen failed: %v", err)
 	}
 	defer listener.Close()
-	logrus.Infof("REDIRECT proxy server listening on 0.0.0.0:%d", s.config.Port)
+	logrus.Infof("%s proxy server listening on 0.0.0.0:%d", s.config.ProxyMode, s.config.Port)
 
 	if s.config.PoolSize > 0 {
 		// --- Worker Pool 模式 ---
@@ -79,7 +79,7 @@ func (s *Server) handleConnection(clientConn *net.TCPConn) {
 		clientConn.Close()
 	}()
 
-	originalDst, err := getOriginalDst(clientConn)
+	originalDst, err := getOriginalDst(clientConn, s.config.ProxyMode)
 	if err != nil {
 		logrus.Debugf("[server] Failed to get original destination: %v", err)
 		return
